@@ -1,50 +1,38 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import os
 from openai import OpenAI
-
-client = OpenAI()
+import os
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-UPLOAD_FOLDER = "storage"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ---------------------------------------
-# 1. UPLOAD API
-# ---------------------------------------
+UPLOAD_DIR = "./storage"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
     if "file" not in request.files:
-        return jsonify({"status": "error", "message": "No file uploaded"})
+        return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
-    filename = file.filename
-    save_path = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(save_path)
+    filepath = os.path.join(UPLOAD_DIR, file.filename)
+    file.save(filepath)
 
-    return jsonify({"status": "success", "path": save_path})
+    return jsonify({"status": "success", "path": filepath})
 
 
-# ---------------------------------------
-# 2. TRANSCRIBE API
-# ---------------------------------------
 @app.route("/api/transcribe", methods=["POST"])
-def transcribe():
-    data = request.json
+def transcribe_audio():
+    data = request.get_json()
     filename = data.get("filename")
+    filepath = os.path.join(UPLOAD_DIR, filename)
 
-    if not filename:
-        return jsonify({"status": "error", "message": "Missing filename"})
+    if not os.path.exists(filepath):
+        return jsonify({"error": "File not found"}), 400
 
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-
-    if not os.path.exists(file_path):
-        return jsonify({"status": "error", "message": "File not found on server"})
-
-    # Whisper API
-    with open(file_path, "rb") as audio_file:
+    with open(filepath, "rb") as audio_file:
         transcript = client.audio.transcriptions.create(
             model="gpt-4o-transcribe",
             file=audio_file
@@ -53,50 +41,39 @@ def transcribe():
     return jsonify({"status": "success", "transcript": transcript.text})
 
 
-# ---------------------------------------
-# 3. OUTLINE API
-# ---------------------------------------
 @app.route("/api/generate-outline", methods=["POST"])
-def gen_outline():
-    data = request.json
+def generate_outline():
+    data = request.get_json()
     text = data.get("text", "")
 
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
+    response = client.chat.completions.create(
+        model="gpt-4.1",
         messages=[
-            {"role": "system", "content": "You create detailed book outlines."},
+            {"role": "system", "content": "Create a professional ebook outline."},
             {"role": "user", "content": text}
         ]
     )
 
-    outline = completion.choices[0].message["content"]
+    outline = response.choices[0].message.content
     return jsonify({"outline": outline})
 
 
-# ---------------------------------------
-# 4. CHAPTER API
-# ---------------------------------------
 @app.route("/api/generate-chapter", methods=["POST"])
-def gen_chapter():
-    data = request.json
+def generate_chapter():
+    data = request.get_json()
     outline = data.get("outline", "")
 
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
+    response = client.chat.completions.create(
+        model="gpt-4.1",
         messages=[
-            {"role": "system", "content": "You write book chapters from outlines."},
+            {"role": "system", "content": "Write a detailed ebook chapter."},
             {"role": "user", "content": outline}
         ]
     )
 
-    chapter = completion.choices[0].message["content"]
+    chapter = response.choices[0].message.content
     return jsonify({"chapter": chapter})
 
 
-@app.route("/")
-def home():
-    return "BlueMarble Ebook Backend is running."
-
-
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run()
