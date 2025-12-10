@@ -4,7 +4,16 @@ from openai import OpenAI
 import os
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={
+    r"/api/*": {
+        "origins": [
+            "https://bluemarble.consulting",
+            "https://www.bluemarble.consulting"
+        ],
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
