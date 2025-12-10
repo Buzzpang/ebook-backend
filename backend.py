@@ -3,142 +3,177 @@ from flask_cors import CORS
 from openai import OpenAI
 import os
 
+# --- Flask & CORS setup ------------------------------------------------------
+
 app = Flask(__name__)
 
-# CORS only for your site
-CORS(app, resources={
-    r"/api/*": {
-        "origins": [
-            "https://bluemarble.consulting",
-            "https://www.bluemarble.consulting"
-        ],
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": [
+                "https://bluemarble.consulting",
+                "https://www.bluemarble.consulting",
+            ],
+            "methods": ["GET", "POST", "OPTIONS"],
+            "allow_headers": ["Content-Type", "Authorization"],
+        }
+    },
+)
 
-# Simple health check
-@app.route("/", methods=["GET"])
+# --- OpenAI client -----------------------------------------------------------
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# --- Storage directory -------------------------------------------------------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, "storage")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+# --- Simple health check -----------------------------------------------------
+
+@app.route("/")
 def index():
     return "BlueMarble AI Ebook backend is running.", 200
 
 
-# OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Storage directory
-UPLOAD_DIR = "./storage"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-
-# ---------- STEP 1: UPLOAD ----------
+# --- STEP 1: Upload audio ----------------------------------------------------
 
 @app.route("/api/upload", methods=["POST"])
 def upload_file():
     if "file" not in request.files:
-        return jsonify({"error": "No file uploaded"}), 400
+        return jsonify({"status": "error", "error": "No file uploaded"}), 400
 
     file = request.files["file"]
-    filepath = os.path.join(UPLOAD_DIR, file.filename)
-    file.save(filepath)
+    if not file.filename:
+        return jsonify({"status": "error", "error": "Empty filename"}), 400
 
-    # Return the full path so the frontend can reuse it directly
-    return jsonify({"status": "success", "path": filepath}), 200
+    # In a real app you'd use secure_filename; for now we keep it simple.
+    filename = file.filename
+    save_path = os.path.join(UPLOAD_DIR, filename)
+    file.save(save_path)
+
+    # Relative path used by frontend & /api/transcribe
+    rel_path = os.path.relpath(save_path, BASE_DIR)  # e.g. "storage/foo.m4a"
+
+    return jsonify({"status": "success", "path": rel_path}), 200
 
 
-# ---------- STEP 2: TRANSCRIBE ----------
+# --- STEP 2: Transcribe audio ------------------------------------------------
 
 @app.route("/api/transcribe", methods=["POST"])
 def transcribe_audio():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
+    path = data.get("path")
 
-    # Accept either "path" or "filename"
-    raw_path = data.get("path") or data.get("filename")
+    if not path:
+        return jsonify({"status": "error", "error": "Missing 'path' in body"}), 400
 
-    if not raw_path:
-        return jsonify({"error": "No path or filename provided"}), 400
+    # Normalize path: allow "storage/..." or "./storage/..."
+    if path.startswith("./"):
+        path = path[2:]
 
-    # If the client already sent ./storage/xxx or /something, use it as-is.
-    # Otherwise, assume it's just the bare filename.
-    if os.path.isabs(raw_path) or raw_path.startswith("storage") or raw_path.startswith("./storage"):
-        filepath = os.path.normpath(raw_path)
-    else:
-        filepath = os.path.join(UPLOAD_DIR, raw_path)
+    audio_path = os.path.join(BASE_DIR, path)
 
-    if not os.path.exists(filepath):
-        return jsonify({
-            "error": "File not found",
-            "filepath": filepath
-        }), 400
+    if not os.path.exists(audio_path):
+        return jsonify(
+            {"status": "error", "error": f"File not found at {path}"}
+        ), 400
 
     try:
-        with open(filepath, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",  # your chosen model
-                file=audio_file
+        with open(audio_path, "rb") as audio_file:
+            result = client.audio.transcriptions.create(
+                model="gpt-4o-transcribe",
+                file=audio_file,
             )
-        return jsonify({"status": "success", "transcript": transcript.text}), 200
+
+        # openai v1.x returns an object with .text
+        transcript_text = getattr(result, "text", None) or str(result)
+
+        return jsonify(
+            {"status": "success", "transcript": transcript_text}
+        ), 200
 
     except Exception as e:
-        # If OpenAI or anything else fails, surface the message
-        return jsonify({
-            "error": "Transcription failed",
-            "details": str(e)
-        }), 500
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
-# ---------- STEP 3: OUTLINE ----------
+# --- STEP 3: Generate outline ------------------------------------------------
 
 @app.route("/api/generate-outline", methods=["POST"])
 def generate_outline():
-    data = request.get_json() or {}
-    text = data.get("text", "")
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "").strip()
+
+    if not text:
+        return jsonify(
+            {"status": "error", "error": "No transcription text provided"}
+        ), 400
+
+    prompt = (
+        "You are an expert editor. Based on the following transcript, "
+        "create a clear, professional ebook outline with parts, chapters, "
+        "and bullet points where helpful.\n\nTRANSCRIPT:\n" + text
+    )
 
     try:
         response = client.chat.completions.create(
             model="gpt-4.1",
             messages=[
-                {"role": "system", "content": "Create a professional ebook outline."},
-                {"role": "user", "content": text}
-            ]
+                {
+                    "role": "system",
+                    "content": "You help structure ebooks into clear outlines.",
+                },
+                {"role": "user", "content": prompt},
+            ],
         )
 
         outline = response.choices[0].message.content
-        return jsonify({"outline": outline}), 200
+        return jsonify({"status": "success", "outline": outline}), 200
 
     except Exception as e:
-        return jsonify({
-            "error": "Outline generation failed",
-            "details": str(e)
-        }), 500
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 
-# ---------- STEP 4: CHAPTER ----------
+# --- STEP 4: Generate chapter -----------------------------------------------
 
 @app.route("/api/generate-chapter", methods=["POST"])
 def generate_chapter():
-    data = request.get_json() or {}
-    outline = data.get("outline", "")
+    data = request.get_json(silent=True) or {}
+    outline = data.get("outline", "").strip()
+
+    if not outline:
+        return jsonify(
+            {"status": "error", "error": "No outline text provided"}
+        ), 400
+
+    prompt = (
+        "Using the following ebook outline, write the first full chapter. "
+        "Use a clear, engaging, business-professional tone.\n\nOUTLINE:\n" + outline
+    )
 
     try:
         response = client.chat.completions.create(
             model="gpt-4.1",
             messages=[
-                {"role": "system", "content": "Write a detailed ebook chapter."},
-                {"role": "user", "content": outline}
-            ]
+                {
+                    "role": "system",
+                    "content": "You write detailed, well-structured ebook chapters.",
+                },
+                {"role": "user", "content": prompt},
+            ],
         )
 
         chapter = response.choices[0].message.content
-        return jsonify({"chapter": chapter}), 200
+        return jsonify({"status": "success", "chapter": chapter}), 200
 
     except Exception as e:
-        return jsonify({
-            "error": "Chapter generation failed",
-            "details": str(e)
-        }), 500
+        return jsonify({"status": "error", "error": str(e)}), 500
 
+
+# --- Local dev entrypoint (Render uses gunicorn backend:app) -----------------
 
 if __name__ == "__main__":
-    # For local debugging only; Render uses gunicorn
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
