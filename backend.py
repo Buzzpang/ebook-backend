@@ -619,6 +619,114 @@ def get_chapter(project_id, chapter_id):
 @app.route("/api/projects/<int:project_id>/generate-chapters", methods=["POST"])
 def generate_chapters_for_project(project_id):
     """
+    Generate ONE chapter draft per call – the first chapter that does not yet have draft_text.
+    Call this endpoint repeatedly until all chapters are filled.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    # 1) Fetch project
+    cur.execute("SELECT * FROM book_projects WHERE id = ?", (project_id,))
+    project_row = cur.fetchone()
+    if project_row is None:
+        conn.close()
+        return jsonify({"status": "error", "error": "Project not found"}), 404
+
+    project = row_to_dict(project_row)
+
+    # 2) Fetch all source text for this project
+    cur.execute(
+        "SELECT content_text FROM source_documents WHERE project_id = ? ORDER BY created_at ASC",
+        (project_id,),
+    )
+    source_rows = cur.fetchall()
+    if not source_rows:
+        conn.close()
+        return jsonify(
+            {"status": "error", "error": "No source documents found for project"}
+        ), 400
+
+    full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
+
+    # 3) Fetch all chapters for this project
+    cur.execute(
+        "SELECT * FROM chapters WHERE project_id = ? ORDER BY chapter_order ASC",
+        (project_id,),
+    )
+    chapter_rows = cur.fetchall()
+    if not chapter_rows:
+        conn.close()
+        return jsonify(
+            {"status": "error", "error": "No chapters found for project"}
+        ), 400
+
+    chapters = [row_to_dict(r) for r in chapter_rows]
+
+    # 4) Pick the FIRST chapter that does not yet have a draft
+    target_chapter = None
+    for chap in chapters:
+        if not chap.get("draft_text"):
+            target_chapter = chap
+            break
+
+    if target_chapter is None:
+        conn.close()
+        return jsonify(
+            {"status": "success", "message": "All chapters already have drafts."}
+        ), 200
+
+    # 5) Build the prompt for this single chapter
+    system_msg = (
+        "You are a professional ghostwriter who creates structured, "
+        "book-quality chapters for business and memoir-style ebooks."
+    )
+
+    user_prompt = (
+        f"You are writing a chapter for an ebook.\n\n"
+        f"Project title: {project.get('title')}\n"
+        f"Subtitle: {project.get('subtitle') or ''}\n"
+        f"Target audience: {project.get('target_audience') or 'Not specified'}\n"
+        f"Tone: {project.get('tone') or 'Business-professional'}\n"
+        f"Language: {project.get('language') or 'en'}\n\n"
+        f"Chapter {target_chapter['chapter_order']}: {target_chapter['title']}\n"
+        f"Chapter summary: {target_chapter.get('summary') or 'No summary provided.'}\n\n"
+        "Source material from the author (notes, transcripts, etc.):\n"
+        f"{full_text}\n\n"
+        "Write a complete, well-structured chapter based on the chapter title, "
+        "summary, and source material. Make it coherent, readable, and grounded "
+        "in the source material where possible."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4.1",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        draft_text = resp.choices[0].message.content
+    except Exception as e:
+        draft_text = f"[ERROR generating chapter: {e}]"
+
+    now = now_iso()
+    cur.execute(
+        """
+        UPDATE chapters
+        SET draft_text = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (draft_text, now, target_chapter["id"]),
+    )
+    conn.commit()
+
+    target_chapter["draft_text"] = draft_text
+    target_chapter["updated_at"] = now
+
+    conn.close()
+    return jsonify({"status": "success", "generated_chapters": [target_chapter]}), 200
+
+    """
     Generate AI drafts for all chapters that don't yet have draft_text.
     Uses all source text + per-chapter title & summary.
     """
