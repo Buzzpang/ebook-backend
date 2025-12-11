@@ -125,7 +125,7 @@ def index():
 
 
 # ============================================================================
-#  EXISTING MVP ENDPOINTS (kept as-is)
+#  EXISTING MVP ENDPOINTS (upload + transcribe + simple outline/chapter)
 # ============================================================================
 
 # --- STEP 1: Upload audio ----------------------------------------------------
@@ -140,7 +140,6 @@ def upload_file():
     if not file.filename:
         return jsonify({"status": "error", "error": "Empty filename"}), 400
 
-    # In a real app you'd use secure_filename; for now we keep it simple.
     filename = file.filename
     save_path = os.path.join(UPLOAD_DIR, filename)
     file.save(save_path)
@@ -182,7 +181,7 @@ def transcribe_audio():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
-# --- STEP 3: Generate outline (legacy, free-form) ----------------------------
+# --- STEP 3: Legacy free-form outline ---------------------------------------
 
 
 @app.route("/api/generate-outline", methods=["POST"])
@@ -217,7 +216,7 @@ def generate_outline():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
-# --- STEP 4: Generate chapter (legacy, single chapter) -----------------------
+# --- STEP 4: Legacy single chapter generation -------------------------------
 
 
 @app.route("/api/generate-chapter", methods=["POST"])
@@ -436,7 +435,8 @@ def build_outline_for_project(project_id):
 
     # gather all source documents
     cur.execute(
-        "SELECT content_text FROM source_documents WHERE project_id = ? ORDER BY created_at ASC",
+        "SELECT content_text FROM source_documents WHERE project_id = ? "
+        "ORDER BY created_at ASC",
         (project_id,),
     )
     source_rows = cur.fetchall()
@@ -494,7 +494,9 @@ def build_outline_for_project(project_id):
         outline_data = json.loads(outline_json_str)
     except Exception as e:
         conn.close()
-        return jsonify({"status": "error", "error": f"Outline generation failed: {e}"}), 500
+        return jsonify(
+            {"status": "error", "error": f"Outline generation failed: {e}"}
+        ), 500
 
     chapters = outline_data.get("chapters") or []
     if not isinstance(chapters, list) or not chapters:
@@ -563,15 +565,12 @@ def build_outline_for_project(project_id):
     ), 200
 
 
-# --- CHAPTER LIST, DETAIL & SINGLE-CHAPTER DRAFT ----------------------------
+# --- CHAPTER LIST & SINGLE-CHAPTER DRAFT ------------------------------------
 
 
 @app.route("/api/chapters/<int:chapter_id>/generate-draft", methods=["POST"])
 def generate_chapter_draft(chapter_id):
-    """
-    Generate a draft for a single chapter.
-    """
-
+    """Generate a draft for a single chapter."""
     conn = get_db()
     cur = conn.cursor()
 
@@ -612,8 +611,6 @@ def generate_chapter_draft(chapter_id):
     source_rows = cur.fetchall()
 
     full_text = "\n\n".join(r["content_text"] for r in source_rows if r["content_text"])
-
-    # Hard-limit the size to keep latency low
     MAX_SOURCE_CHARS = 4000
     limited_text = (full_text or "")[:MAX_SOURCE_CHARS]
 
@@ -664,7 +661,7 @@ def generate_chapter_draft(chapter_id):
             500,
         )
 
-    # 5) Save draft into DB
+    # 4) Save draft into DB
     now = now_iso()
     cur.execute(
         """
@@ -712,10 +709,9 @@ def list_chapters_for_project(project_id):
     return jsonify({"status": "success", "chapters": chapters}), 200
 
 
-@app.route(
-    "/api/projects/<int:project_id>/chapters/<int:chapter_id>", methods=["GET"]
-)
-def get_chapter(project_id, chapter_id):
+@app.route("/api/projects/<int:project_id>/chapters/<int:chapter_id>", methods=["GET"])
+def get_project_chapter(project_id, chapter_id):
+    """Get a single chapter for a given project."""
     conn = get_db()
     cur = conn.cursor()
 
@@ -758,7 +754,8 @@ def generate_chapters_for_project(project_id):
 
     # 2) Fetch all source text for this project
     cur.execute(
-        "SELECT content_text FROM source_documents WHERE project_id = ? ORDER BY created_at ASC",
+        "SELECT content_text FROM source_documents WHERE project_id = ? "
+        "ORDER BY created_at ASC",
         (project_id,),
     )
     source_rows = cur.fetchall()
@@ -852,7 +849,7 @@ def generate_chapters_for_project(project_id):
     return jsonify({"status": "success", "generated_chapters": [target_chapter]}), 200
 
 
-# --- Local dev entrypoint (Render uses: gunicorn backend:app) ----------------
+# --- Local dev entrypoint (Render uses: gunicorn backend:app) ---------------
 
 
 if __name__ == "__main__":
