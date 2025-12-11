@@ -452,6 +452,11 @@ def build_outline_for_project(project_id):
 
     full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
 
+# Limit the source text so the prompt doesn't get huge (helps latency)
+MAX_SOURCE_CHARS = 4000
+limited_text = full_text[:MAX_SOURCE_CHARS]
+
+
     # Build JSON outline
     system_msg = (
         "You are an expert editorial planner. "
@@ -699,12 +704,15 @@ def generate_chapters_for_project(project_id):
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
+    # use a smaller, faster model for speed
+    model="gpt-4.1-mini",  # or "gpt-4o-mini" if that's what you're using elsewhere
+    messages=[
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_prompt},
+    ],
+    max_output_tokens=800,  # keep chapter reasonably sized so response is fast
+)
+
         draft_text = resp.choices[0].message.content
     except Exception as e:
         draft_text = f"[ERROR generating chapter: {e}]"
@@ -794,7 +802,8 @@ def generate_chapters_for_project(project_id):
             f"Chapter {chap['chapter_order']}: {chap['title']}\n"
             f"Chapter summary: {chap.get('summary') or 'No summary provided.'}\n\n"
             "Source material from the author (notes, transcripts, etc.):\n"
-            f"{full_text}\n\n"
+f"{limited_text}\n\n"
+
             "Write a complete, well-structured chapter based on the chapter title, "
             "summary, and source material. Make it coherent, readable, and grounded "
             "in the source material where possible."
