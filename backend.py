@@ -6,7 +6,6 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
-client = OpenAI()
 
 # --- Flask & CORS setup ------------------------------------------------------
 
@@ -112,6 +111,11 @@ def row_to_dict(row):
     return {k: row[k] for k in row.keys()}
 
 
+def now_iso():
+    """UTC timestamp in ISO format with Z."""
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
 # --- Simple health check -----------------------------------------------------
 
 
@@ -123,7 +127,6 @@ def index():
 # ============================================================================
 #  EXISTING MVP ENDPOINTS (kept as-is)
 # ============================================================================
-
 
 # --- STEP 1: Upload audio ----------------------------------------------------
 
@@ -251,13 +254,6 @@ def generate_chapter():
 # ============================================================================
 #  NEW: PROJECTS + TEXT → OUTLINE (JSON) → MULTIPLE CHAPTER DRAFTS
 # ============================================================================
-
-# --- Helper to get timestamps ------------------------------------------------
-
-
-def now_iso():
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
 
 # --- PROJECTS ----------------------------------------------------------------
 
@@ -453,10 +449,9 @@ def build_outline_for_project(project_id):
 
     full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
 
-# Limit the source text so the prompt doesn't get huge (helps latency)
-MAX_SOURCE_CHARS = 4000
-limited_text = full_text[:MAX_SOURCE_CHARS]
-
+    # Limit the source text so the prompt doesn't get huge (helps latency)
+    MAX_SOURCE_CHARS = 4000
+    limited_text = full_text[:MAX_SOURCE_CHARS]
 
     # Build JSON outline
     system_msg = (
@@ -483,7 +478,7 @@ limited_text = full_text[:MAX_SOURCE_CHARS]
         f"- Target language: {project.get('language') or 'en'}\n"
         "Make the number of chapters and structure appropriate for a serious ebook.\n\n"
         "SOURCE MATERIAL:\n"
-        + full_text
+        + limited_text
     )
 
     try:
@@ -568,18 +563,13 @@ limited_text = full_text[:MAX_SOURCE_CHARS]
     ), 200
 
 
-# --- CHAPTER LIST & DETAIL ---------------------------------------------------
+# --- CHAPTER LIST, DETAIL & SINGLE-CHAPTER DRAFT ----------------------------
 
 
 @app.route("/api/chapters/<int:chapter_id>/generate-draft", methods=["POST"])
 def generate_chapter_draft(chapter_id):
     """
     Generate a draft for a single chapter.
-
-    This is intentionally small and fast:
-    - one OpenAI call
-    - limited source text
-    - limited output length
     """
 
     conn = get_db()
@@ -607,7 +597,7 @@ def generate_chapter_draft(chapter_id):
         conn.close()
         return jsonify({"status": "error", "error": "Chapter not found"}), 404
 
-    chapter = row_to_dict(row)  # uses your existing helper
+    chapter = row_to_dict(row)
 
     # 2) Load source text for this project
     cur.execute(
@@ -651,9 +641,8 @@ def generate_chapter_draft(chapter_id):
     )
 
     try:
-        # 4) Fast model + max_output_tokens to keep it under the Render timeout
         resp = client.chat.completions.create(
-            model="gpt-4.1-mini",  # or "gpt-4o-mini" if that's what you're using
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_prompt},
@@ -676,7 +665,7 @@ def generate_chapter_draft(chapter_id):
         )
 
     # 5) Save draft into DB
-    now = now_iso()  # uses your existing helper
+    now = now_iso()
     cur.execute(
         """
         UPDATE chapters
@@ -696,6 +685,10 @@ def generate_chapter_draft(chapter_id):
         }
     ), 200
 
+
+@app.route("/api/projects/<int:project_id>/chapters", methods=["GET"])
+def list_chapters_for_project(project_id):
+    """List all chapters for a given project."""
     conn = get_db()
     cur = conn.cursor()
 
@@ -742,7 +735,7 @@ def get_chapter(project_id, chapter_id):
     return jsonify({"status": "success", "chapter": row_to_dict(row)}), 200
 
 
-# --- GENERATE DRAFTS FOR CHAPTERS -------------------------------------------
+# --- GENERATE DRAFTS FOR CHAPTERS (ONE PER CALL) ----------------------------
 
 
 @app.route("/api/projects/<int:project_id>/generate-chapters", methods=["POST"])
@@ -776,6 +769,8 @@ def generate_chapters_for_project(project_id):
         ), 400
 
     full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
+    MAX_SOURCE_CHARS = 4000
+    limited_text = full_text[:MAX_SOURCE_CHARS]
 
     # 3) Fetch all chapters for this project
     cur.execute(
@@ -820,7 +815,7 @@ def generate_chapters_for_project(project_id):
         f"Chapter {target_chapter['chapter_order']}: {target_chapter['title']}\n"
         f"Chapter summary: {target_chapter.get('summary') or 'No summary provided.'}\n\n"
         "Source material from the author (notes, transcripts, etc.):\n"
-        f"{full_text}\n\n"
+        f"{limited_text}\n\n"
         "Write a complete, well-structured chapter based on the chapter title, "
         "summary, and source material. Make it coherent, readable, and grounded "
         "in the source material where possible."
@@ -828,15 +823,13 @@ def generate_chapters_for_project(project_id):
 
     try:
         resp = client.chat.completions.create(
-    # use a smaller, faster model for speed
-    model="gpt-4.1-mini",  # or "gpt-4o-mini" if that's what you're using elsewhere
-    messages=[
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_prompt},
-    ],
-    max_output_tokens=800,  # keep chapter reasonably sized so response is fast
-)
-
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_output_tokens=800,
+        )
         draft_text = resp.choices[0].message.content
     except Exception as e:
         draft_text = f"[ERROR generating chapter: {e}]"
@@ -858,122 +851,8 @@ def generate_chapters_for_project(project_id):
     conn.close()
     return jsonify({"status": "success", "generated_chapters": [target_chapter]}), 200
 
-    """
-    Generate AI drafts for all chapters that don't yet have draft_text.
-    Uses all source text + per-chapter title & summary.
-    """
-    conn = get_db()
-    cur = conn.cursor()
 
-    # fetch project
-    cur.execute("SELECT * FROM book_projects WHERE id = ?", (project_id,))
-    project_row = cur.fetchone()
-    if project_row is None:
-        conn.close()
-        return jsonify({"status": "error", "error": "Project not found"}), 404
-
-    project = row_to_dict(project_row)
-
-    # fetch combined source text
-    cur.execute(
-        "SELECT content_text FROM source_documents WHERE project_id = ? ORDER BY created_at ASC",
-        (project_id,),
-    )
-    source_rows = cur.fetchall()
-    if not source_rows:
-        conn.close()
-        return jsonify(
-            {"status": "error", "error": "No source documents found for project"}
-        ), 400
-
-    full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
-
-    # fetch chapters needing drafts
-    cur.execute(
-        """
-        SELECT * FROM chapters
-        WHERE project_id = ? AND (draft_text IS NULL OR draft_text = '')
-        ORDER BY chapter_order ASC
-        """,
-        (project_id,),
-    )
-    chapter_rows = cur.fetchall()
-
-    if not chapter_rows:
-        conn.close()
-        return jsonify(
-            {"status": "success", "message": "All chapters already have drafts."}
-        ), 200
-
-    generated = []
-    now = now_iso()
-
-    for row in chapter_rows:
-        chap = row_to_dict(row)
-
-        system_msg = (
-            "You are a professional ghostwriter who creates structured, "
-            "book-quality chapters for business and memoir-style ebooks."
-        )
-
-        user_prompt = (
-            f"You are writing a chapter for an ebook.\n\n"
-            f"Project title: {project.get('title')}\n"
-            f"Subtitle: {project.get('subtitle') or ''}\n"
-            f"Target audience: {project.get('target_audience') or 'Not specified'}\n"
-            f"Tone: {project.get('tone') or 'Business-professional'}\n"
-            f"Language: {project.get('language') or 'en'}\n\n"
-            f"Chapter {chap['chapter_order']}: {chap['title']}\n"
-            f"Chapter summary: {chap.get('summary') or 'No summary provided.'}\n\n"
-            "Source material from the author (notes, transcripts, etc.):\n"
-f"{limited_text}\n\n"
-
-            "Write a complete, well-structured chapter based on the chapter title, "
-            "summary, and source material. Make it coherent, readable, and grounded "
-            "in the source material where possible."
-        )
-
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4.1",
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            draft_text = resp.choices[0].message.content
-        except Exception as e:
-            # If one chapter fails, note it and continue
-            draft_text = f"[ERROR generating chapter: {e}]"
-
-        cur.execute(
-            """
-            UPDATE chapters
-            SET draft_text = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (draft_text, now, chap["id"]),
-        )
-
-        chap["draft_text"] = draft_text
-        chap["updated_at"] = now
-        generated.append(chap)
-
-    conn.commit()
-    conn.close()
-
-    # return all chapters (including newly generated ones) for convenience
-    generated_sorted = sorted(generated, key=lambda c: c["chapter_order"])
-
-    return jsonify(
-        {
-            "status": "success",
-            "generated_chapters": generated_sorted,
-        }
-    ), 200
-
-
-# --- Local dev entrypoint (Render uses gunicorn backend:app) -----------------
+# --- Local dev entrypoint (Render uses: gunicorn backend:app) ----------------
 
 
 if __name__ == "__main__":
