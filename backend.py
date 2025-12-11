@@ -6,6 +6,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
+client = OpenAI()
 
 # --- Flask & CORS setup ------------------------------------------------------
 
@@ -570,8 +571,131 @@ limited_text = full_text[:MAX_SOURCE_CHARS]
 # --- CHAPTER LIST & DETAIL ---------------------------------------------------
 
 
-@app.route("/api/projects/<int:project_id>/chapters", methods=["GET"])
-def list_chapters(project_id):
+@app.route("/api/chapters/<int:chapter_id>/generate-draft", methods=["POST"])
+def generate_chapter_draft(chapter_id):
+    """
+    Generate a draft for a single chapter.
+
+    This is intentionally small and fast:
+    - one OpenAI call
+    - limited source text
+    - limited output length
+    """
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    # 1) Load chapter + its project info
+    cur.execute(
+        """
+        SELECT
+            c.*,
+            p.title AS project_title,
+            p.subtitle AS project_subtitle,
+            p.target_audience,
+            p.tone,
+            p.language
+        FROM chapters c
+        JOIN book_projects p ON c.project_id = p.id
+        WHERE c.id = ?
+        """,
+        (chapter_id,),
+    )
+    row = cur.fetchone()
+
+    if row is None:
+        conn.close()
+        return jsonify({"status": "error", "error": "Chapter not found"}), 404
+
+    chapter = row_to_dict(row)  # uses your existing helper
+
+    # 2) Load source text for this project
+    cur.execute(
+        """
+        SELECT content_text
+        FROM source_documents
+        WHERE project_id = ?
+        ORDER BY created_at ASC
+        """,
+        (chapter["project_id"],),
+    )
+    source_rows = cur.fetchall()
+
+    full_text = "\n\n".join(r["content_text"] for r in source_rows if r["content_text"])
+
+    # Hard-limit the size to keep latency low
+    MAX_SOURCE_CHARS = 4000
+    limited_text = (full_text or "")[:MAX_SOURCE_CHARS]
+
+    # 3) Build a compact prompt
+    system_msg = (
+        "You are a professional ghostwriter who writes clear, structured, "
+        "business ebooks for busy professionals."
+    )
+
+    user_prompt = (
+        f"You are writing a chapter for an ebook.\n\n"
+        f"Book title: {chapter.get('project_title')}\n"
+        f"Subtitle: {chapter.get('project_subtitle') or ''}\n"
+        f"Target audience: {chapter.get('target_audience') or 'Business readers'}\n"
+        f"Tone: {chapter.get('tone') or 'Professional'}\n"
+        f"Language: {chapter.get('language') or 'en'}\n\n"
+        f"Chapter {chapter['chapter_order']}: {chapter['title']}\n"
+        f"Chapter summary:\n{chapter.get('summary') or 'No summary provided.'}\n\n"
+        "Source material from the author (notes, transcripts, etc.):\n"
+        f"{limited_text}\n\n"
+        "Write a complete, well-structured draft of this chapter.\n"
+        "- 800–1,200 words.\n"
+        "- Use short paragraphs and helpful subheadings.\n"
+        "- Keep the tone business-professional and easy to read.\n"
+    )
+
+    try:
+        # 4) Fast model + max_output_tokens to keep it under the Render timeout
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",  # or "gpt-4o-mini" if that's what you're using
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_output_tokens=900,
+        )
+        draft_text = resp.choices[0].message.content
+    except Exception as e:
+        conn.close()
+        print(f"Error generating draft for chapter {chapter_id}: {e}")
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "error": "Failed to generate chapter draft",
+                    "details": str(e),
+                }
+            ),
+            500,
+        )
+
+    # 5) Save draft into DB
+    now = now_iso()  # uses your existing helper
+    cur.execute(
+        """
+        UPDATE chapters
+        SET draft_text = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (draft_text, now, chapter_id),
+    )
+    conn.commit()
+    conn.close()
+
+    return jsonify(
+        {
+            "status": "success",
+            "chapter_id": chapter_id,
+            "updated_at": now,
+        }
+    ), 200
+
     conn = get_db()
     cur = conn.cursor()
 
