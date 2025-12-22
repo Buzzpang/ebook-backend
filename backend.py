@@ -6,8 +6,8 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 
 from openai import OpenAI
 
@@ -83,11 +83,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 def get_db():
     """
     Open a new Postgres connection.
-    Uses RealDictCursor so rows come back as dicts.
+    Uses dict_row so rows come back as dicts.
     """
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set. Add it in Render -> Environment.")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    # psycopg v3:
+    # - row_factory=dict_row makes fetchone()/fetchall() return dict-like rows
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def now_iso():
@@ -470,7 +472,6 @@ def build_outline_for_project(project_id):
         conn = get_db()
         cur = conn.cursor()
 
-        # Ensure project exists
         cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
         project_row = cur.fetchone()
         if project_row is None:
@@ -478,7 +479,6 @@ def build_outline_for_project(project_id):
 
         project = row_to_dict(project_row)
 
-        # Load all source documents
         cur.execute(
             """
             SELECT content_text
@@ -519,7 +519,6 @@ def build_outline_for_project(project_id):
             + limited_text
         )
 
-        # OpenAI call
         response = client.chat.completions.create(
             model=MODEL_OUTLINE_JSON,
             response_format={"type": "json_object"},
@@ -537,8 +536,6 @@ def build_outline_for_project(project_id):
 
         now = now_iso()
 
-        # ---- ATOMIC DB UPDATE START ----
-        # If anything fails below, we'll rollback.
         cur.execute("DELETE FROM chapters WHERE project_id = %s", (project_id,))
 
         saved_chapters = []
@@ -567,7 +564,6 @@ def build_outline_for_project(project_id):
         )
 
         conn.commit()
-        # ---- ATOMIC DB UPDATE END ----
 
         saved_chapters_sorted = sorted(saved_chapters, key=lambda c: c["chapter_order"])
         return jsonify({"status": "success", "outline": outline_data, "chapters": saved_chapters_sorted}), 200
@@ -655,7 +651,6 @@ def generate_chapter_draft(chapter_id):
         conn = get_db()
         cur = conn.cursor()
 
-        # Load chapter + project metadata
         cur.execute(
             """
             SELECT
@@ -677,7 +672,6 @@ def generate_chapter_draft(chapter_id):
 
         chapter = row_to_dict(row)
 
-        # Load source text
         cur.execute(
             """
             SELECT content_text
@@ -714,7 +708,6 @@ def generate_chapter_draft(chapter_id):
             "- Keep the tone business-professional and easy to read.\n"
         )
 
-        # OpenAI call
         resp = client.chat.completions.create(
             model=MODEL_DRAFT,
             messages=[
@@ -726,7 +719,6 @@ def generate_chapter_draft(chapter_id):
         )
         draft_text = resp.choices[0].message.content
 
-        # Save
         now = now_iso()
         cur.execute(
             """
@@ -769,14 +761,12 @@ def generate_chapters_for_project(project_id):
         conn = get_db()
         cur = conn.cursor()
 
-        # Fetch project
         cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
         project_row = cur.fetchone()
         if project_row is None:
             return jsonify({"status": "error", "error": "Project not found"}), 404
         project = row_to_dict(project_row)
 
-        # Fetch source text
         cur.execute(
             """
             SELECT content_text
@@ -793,7 +783,6 @@ def generate_chapters_for_project(project_id):
         full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
         limited_text = full_text[:MAX_SOURCE_CHARS]
 
-        # Fetch chapters
         cur.execute(
             "SELECT * FROM chapters WHERE project_id = %s ORDER BY chapter_order ASC",
             (project_id,),
@@ -803,8 +792,6 @@ def generate_chapters_for_project(project_id):
             return jsonify({"status": "error", "error": "No chapters found for project"}), 400
 
         chapters = [row_to_dict(r) for r in chapter_rows]
-
-        # Pick the first chapter without a draft
         target_chapter = next((c for c in chapters if not c.get("draft_text")), None)
         if target_chapter is None:
             return jsonify({"status": "success", "message": "All chapters already have drafts."}), 200
@@ -832,7 +819,6 @@ def generate_chapters_for_project(project_id):
             "- Use short paragraphs and subheadings\n"
         )
 
-        # OpenAI call (if this fails, we return 500 and do NOT update DB)
         resp = client.chat.completions.create(
             model=MODEL_DRAFT,
             messages=[
@@ -855,7 +841,6 @@ def generate_chapters_for_project(project_id):
         )
         conn.commit()
 
-        # Return the updated chapter row
         cur.execute("SELECT * FROM chapters WHERE id = %s", (target_chapter["id"],))
         updated = row_to_dict(cur.fetchone())
 
