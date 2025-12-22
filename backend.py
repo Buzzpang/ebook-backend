@@ -7,13 +7,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from openai import OpenAI
 
-# Optional Postgres (Neon) support
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-USE_POSTGRES = bool(DATABASE_URL)
-
-if USE_POSTGRES:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
+# Postgres (Neon) support
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # --- Flask & CORS setup ------------------------------------------------------
 
@@ -43,7 +39,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "storage")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# --- SQLite fallback (local only) -------------------------------------------
+# --- Database config ---------------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL")  # Set this in Render (Neon connection string)
+DB_DIALECT = "postgres" if DATABASE_URL else "sqlite"
 
 SQLITE_DB_PATH = os.path.join(BASE_DIR, "ebook.db")
 
@@ -53,18 +52,14 @@ def now_iso():
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
 
-# ----------------------------------------------------------------------------
-# DB Helpers (Postgres preferred via DATABASE_URL; SQLite fallback)
-# ----------------------------------------------------------------------------
-
 def get_db():
     """
-    Returns a connection:
-    - Postgres if DATABASE_URL is set
-    - otherwise SQLite (local/dev fallback)
+    Returns a DB connection.
+    - If DATABASE_URL is set: Postgres (Neon) via psycopg2
+    - Else: local SQLite file
     """
-    if USE_POSTGRES:
-        # Neon typically requires SSL; your DATABASE_URL already includes sslmode=require.
+    if DB_DIALECT == "postgres":
+        # Neon URLs usually include sslmode=require already; if not, add it in Neon UI.
         conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
         return conn
     else:
@@ -73,29 +68,20 @@ def get_db():
         return conn
 
 
-def fetchone(cur):
-    row = cur.fetchone()
-    # sqlite returns Row; postgres returns dict (RealDictCursor)
+def row_to_dict(row):
     if row is None:
         return None
-    if USE_POSTGRES:
-        return row  # already dict
+    if isinstance(row, dict):
+        return row
     return {k: row[k] for k in row.keys()}
-
-
-def fetchall(cur):
-    rows = cur.fetchall()
-    if USE_POSTGRES:
-        return rows  # list of dicts
-    return [{k: r[k] for k in r.keys()} for r in rows]
 
 
 def init_db():
     conn = get_db()
     cur = conn.cursor()
 
-    if USE_POSTGRES:
-        # Postgres schema
+    if DB_DIALECT == "postgres":
+        # Postgres DDL
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS book_projects (
@@ -117,7 +103,7 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS source_documents (
                 id SERIAL PRIMARY KEY,
-                project_id INTEGER NOT NULL REFERENCES book_projects(id) ON DELETE CASCADE,
+                project_id INTEGER NOT NULL REFERENCES book_projects(id),
                 label TEXT,
                 content_text TEXT NOT NULL,
                 created_at TEXT NOT NULL,
@@ -130,7 +116,7 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS chapters (
                 id SERIAL PRIMARY KEY,
-                project_id INTEGER NOT NULL REFERENCES book_projects(id) ON DELETE CASCADE,
+                project_id INTEGER NOT NULL REFERENCES book_projects(id),
                 chapter_order INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 summary TEXT,
@@ -141,7 +127,7 @@ def init_db():
             """
         )
     else:
-        # SQLite schema
+        # SQLite DDL
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS book_projects (
@@ -254,7 +240,7 @@ def transcribe_audio():
 @app.route("/api/generate-outline", methods=["POST"])
 def generate_outline():
     data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "").strip()
+    text = data.get("text", "").strip()
 
     if not text:
         return jsonify({"status": "error", "error": "No transcription text provided"}), 400
@@ -262,8 +248,7 @@ def generate_outline():
     prompt = (
         "You are an expert editor. Based on the following transcript, "
         "create a clear, professional ebook outline with parts, chapters, "
-        "and bullet points where helpful.\n\nTRANSCRIPT:\n"
-        + text
+        "and bullet points where helpful.\n\nTRANSCRIPT:\n" + text
     )
 
     try:
@@ -283,15 +268,14 @@ def generate_outline():
 @app.route("/api/generate-chapter", methods=["POST"])
 def generate_chapter():
     data = request.get_json(silent=True) or {}
-    outline = (data.get("outline") or "").strip()
+    outline = data.get("outline", "").strip()
 
     if not outline:
         return jsonify({"status": "error", "error": "No outline text provided"}), 400
 
     prompt = (
         "Using the following ebook outline, write the first full chapter. "
-        "Use a clear, engaging, business-professional tone.\n\nOUTLINE:\n"
-        + outline
+        "Use a clear, engaging, business-professional tone.\n\nOUTLINE:\n" + outline
     )
 
     try:
@@ -331,18 +315,22 @@ def create_project():
     conn = get_db()
     cur = conn.cursor()
 
-    if USE_POSTGRES:
+    if DB_DIALECT == "postgres":
         cur.execute(
             """
             INSERT INTO book_projects
                 (title, subtitle, target_audience, tone, language,
                  word_count_target, outline_json, created_at, updated_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            RETURNING id
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *;
             """,
             (title, subtitle, target_audience, tone, language, word_count_target, None, created_at, updated_at),
         )
-        project_id = cur.fetchone()["id"]
+        row = cur.fetchone()
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success", "project": row_to_dict(row)}), 201
+
     else:
         cur.execute(
             """
@@ -354,18 +342,11 @@ def create_project():
             (title, subtitle, target_audience, tone, language, word_count_target, None, created_at, updated_at),
         )
         project_id = cur.lastrowid
-
-    conn.commit()
-
-    # fetch created row
-    if USE_POSTGRES:
-        cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
-    else:
+        conn.commit()
         cur.execute("SELECT * FROM book_projects WHERE id = ?", (project_id,))
-    row = fetchone(cur)
-
-    conn.close()
-    return jsonify({"status": "success", "project": row}), 201
+        row = cur.fetchone()
+        conn.close()
+        return jsonify({"status": "success", "project": row_to_dict(row)}), 201
 
 
 @app.route("/api/projects", methods=["GET"])
@@ -373,13 +354,11 @@ def list_projects():
     conn = get_db()
     cur = conn.cursor()
 
-    if USE_POSTGRES:
-        cur.execute("SELECT * FROM book_projects ORDER BY created_at DESC")
-    else:
-        cur.execute("SELECT * FROM book_projects ORDER BY created_at DESC")
-
-    projects = fetchall(cur)
+    cur.execute("SELECT * FROM book_projects ORDER BY created_at DESC")
+    rows = cur.fetchall()
     conn.close()
+
+    projects = [row_to_dict(r) for r in rows]
     return jsonify({"status": "success", "projects": projects}), 200
 
 
@@ -388,17 +367,19 @@ def get_project(project_id):
     conn = get_db()
     cur = conn.cursor()
 
-    if USE_POSTGRES:
+    if DB_DIALECT == "postgres":
         cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
     else:
         cur.execute("SELECT * FROM book_projects WHERE id = ?", (project_id,))
-    project = fetchone(cur)
 
-    if not project:
+    row = cur.fetchone()
+    if not row:
         conn.close()
         return jsonify({"status": "error", "error": "Project not found"}), 404
 
-    if USE_POSTGRES:
+    project = row_to_dict(row)
+
+    if DB_DIALECT == "postgres":
         cur.execute("SELECT COUNT(*) AS cnt FROM source_documents WHERE project_id = %s", (project_id,))
         project["source_document_count"] = cur.fetchone()["cnt"]
         cur.execute("SELECT COUNT(*) AS cnt FROM chapters WHERE project_id = %s", (project_id,))
@@ -417,6 +398,7 @@ def get_project(project_id):
 def add_text_source(project_id):
     data = request.get_json(silent=True) or {}
     text = (data.get("text") or "").strip()
+
     if not text:
         return jsonify({"status": "error", "error": "text is required"}), 400
 
@@ -427,30 +409,35 @@ def add_text_source(project_id):
     cur = conn.cursor()
 
     # ensure project exists
-    if USE_POSTGRES:
+    if DB_DIALECT == "postgres":
         cur.execute("SELECT id FROM book_projects WHERE id = %s", (project_id,))
     else:
         cur.execute("SELECT id FROM book_projects WHERE id = ?", (project_id,))
+
     if cur.fetchone() is None:
         conn.close()
         return jsonify({"status": "error", "error": "Project not found"}), 404
 
-    if USE_POSTGRES:
+    if DB_DIALECT == "postgres":
         cur.execute(
             """
-            INSERT INTO source_documents (project_id, label, content_text, created_at, updated_at)
-            VALUES (%s,%s,%s,%s,%s)
-            RETURNING id
+            INSERT INTO source_documents
+                (project_id, label, content_text, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING *;
             """,
             (project_id, label, text, now, now),
         )
-        doc_id = cur.fetchone()["id"]
+        row = cur.fetchone()
         conn.commit()
-        cur.execute("SELECT * FROM source_documents WHERE id = %s", (doc_id,))
+        conn.close()
+        return jsonify({"status": "success", "source_document": row_to_dict(row)}), 201
+
     else:
         cur.execute(
             """
-            INSERT INTO source_documents (project_id, label, content_text, created_at, updated_at)
+            INSERT INTO source_documents
+                (project_id, label, content_text, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
             """,
             (project_id, label, text, now, now),
@@ -458,10 +445,9 @@ def add_text_source(project_id):
         doc_id = cur.lastrowid
         conn.commit()
         cur.execute("SELECT * FROM source_documents WHERE id = ?", (doc_id,))
-
-    row = fetchone(cur)
-    conn.close()
-    return jsonify({"status": "success", "source_document": row}), 201
+        row = cur.fetchone()
+        conn.close()
+        return jsonify({"status": "success", "source_document": row_to_dict(row)}), 201
 
 
 @app.route("/api/projects/<int:project_id>/build-outline", methods=["POST"])
@@ -470,18 +456,20 @@ def build_outline_for_project(project_id):
     cur = conn.cursor()
 
     # ensure project exists
-    if USE_POSTGRES:
+    if DB_DIALECT == "postgres":
         cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
     else:
         cur.execute("SELECT * FROM book_projects WHERE id = ?", (project_id,))
-    project = fetchone(cur)
 
-    if not project:
+    project_row = cur.fetchone()
+    if project_row is None:
         conn.close()
         return jsonify({"status": "error", "error": "Project not found"}), 404
 
+    project = row_to_dict(project_row)
+
     # gather all source documents
-    if USE_POSTGRES:
+    if DB_DIALECT == "postgres":
         cur.execute(
             "SELECT content_text FROM source_documents WHERE project_id = %s ORDER BY created_at ASC",
             (project_id,),
@@ -491,17 +479,13 @@ def build_outline_for_project(project_id):
             "SELECT content_text FROM source_documents WHERE project_id = ? ORDER BY created_at ASC",
             (project_id,),
         )
-
     source_rows = cur.fetchall()
+
     if not source_rows:
         conn.close()
         return jsonify({"status": "error", "error": "No source documents found for project"}), 400
 
-    # source_rows items differ between sqlite/pg fetch style
-    if USE_POSTGRES:
-        full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
-    else:
-        full_text = "\n\n".join(r[0] for r in source_rows).strip()
+    full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
 
     MAX_SOURCE_CHARS = 4000
     limited_text = full_text[:MAX_SOURCE_CHARS]
@@ -526,8 +510,7 @@ def build_outline_for_project(project_id):
         f"- Tone: {project.get('tone') or 'Business-professional'}\n"
         f"- Target language: {project.get('language') or 'en'}\n"
         "Make the number of chapters and structure appropriate for a serious ebook.\n\n"
-        "SOURCE MATERIAL:\n"
-        + limited_text
+        "SOURCE MATERIAL:\n" + limited_text
     )
 
     try:
@@ -538,7 +521,6 @@ def build_outline_for_project(project_id):
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=900,
         )
         outline_json_str = response.choices[0].message.content
         outline_data = json.loads(outline_json_str)
@@ -553,8 +535,8 @@ def build_outline_for_project(project_id):
 
     now = now_iso()
 
-    # Clear any existing chapters for this project
-    if USE_POSTGRES:
+    # Clear chapters
+    if DB_DIALECT == "postgres":
         cur.execute("DELETE FROM chapters WHERE project_id = %s", (project_id,))
     else:
         cur.execute("DELETE FROM chapters WHERE project_id = ?", (project_id,))
@@ -567,13 +549,13 @@ def build_outline_for_project(project_id):
         if not title:
             continue
 
-        if USE_POSTGRES:
+        if DB_DIALECT == "postgres":
             cur.execute(
                 """
                 INSERT INTO chapters
                     (project_id, chapter_order, title, summary, draft_text, created_at, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-                RETURNING id
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id;
                 """,
                 (project_id, order, title, summary, None, now, now),
             )
@@ -603,7 +585,7 @@ def build_outline_for_project(project_id):
         )
 
     # Persist outline JSON on project
-    if USE_POSTGRES:
+    if DB_DIALECT == "postgres":
         cur.execute(
             "UPDATE book_projects SET outline_json = %s, updated_at = %s WHERE id = %s",
             (json.dumps(outline_data), now, project_id),
@@ -618,35 +600,8 @@ def build_outline_for_project(project_id):
     conn.close()
 
     return jsonify(
-        {
-            "status": "success",
-            "outline": outline_data,
-            "chapters": sorted(saved_chapters, key=lambda c: c["chapter_order"]),
-        }
+        {"status": "success", "outline": outline_data, "chapters": sorted(saved_chapters, key=lambda c: c["chapter_order"])}
     ), 200
-
-
-@app.route("/api/projects/<int:project_id>/chapters", methods=["GET"])
-def list_chapters_for_project(project_id):
-    conn = get_db()
-    cur = conn.cursor()
-
-    if USE_POSTGRES:
-        cur.execute("SELECT id FROM book_projects WHERE id = %s", (project_id,))
-    else:
-        cur.execute("SELECT id FROM book_projects WHERE id = ?", (project_id,))
-    if cur.fetchone() is None:
-        conn.close()
-        return jsonify({"status": "error", "error": "Project not found"}), 404
-
-    if USE_POSTGRES:
-        cur.execute("SELECT * FROM chapters WHERE project_id = %s ORDER BY chapter_order ASC", (project_id,))
-    else:
-        cur.execute("SELECT * FROM chapters WHERE project_id = ? ORDER BY chapter_order ASC", (project_id,))
-
-    chapters = fetchall(cur)
-    conn.close()
-    return jsonify({"status": "success", "chapters": chapters}), 200
 
 
 @app.route("/api/chapters/<int:chapter_id>/generate-draft", methods=["POST"])
@@ -654,8 +609,8 @@ def generate_chapter_draft(chapter_id):
     conn = get_db()
     cur = conn.cursor()
 
-    # Load chapter + its project info
-    if USE_POSTGRES:
+    # Load chapter + project
+    if DB_DIALECT == "postgres":
         cur.execute(
             """
             SELECT
@@ -688,29 +643,28 @@ def generate_chapter_draft(chapter_id):
             (chapter_id,),
         )
 
-    chapter = fetchone(cur)
-    if not chapter:
+    row = cur.fetchone()
+    if row is None:
         conn.close()
         return jsonify({"status": "error", "error": "Chapter not found"}), 404
 
-    # Load all source text for this project
-    if USE_POSTGRES:
+    chapter = row_to_dict(row)
+
+    # Load source text
+    if DB_DIALECT == "postgres":
         cur.execute(
             "SELECT content_text FROM source_documents WHERE project_id = %s ORDER BY created_at ASC",
             (chapter["project_id"],),
         )
-        source_rows = cur.fetchall()
-        full_text = "\n\n".join(r["content_text"] for r in source_rows if r.get("content_text"))
     else:
         cur.execute(
             "SELECT content_text FROM source_documents WHERE project_id = ? ORDER BY created_at ASC",
             (chapter["project_id"],),
         )
-        source_rows = cur.fetchall()
-        full_text = "\n\n".join(r[0] for r in source_rows if r[0])
+    source_rows = cur.fetchall()
 
-    MAX_SOURCE_CHARS = 4000
-    limited_text = (full_text or "")[:MAX_SOURCE_CHARS]
+    full_text = "\n\n".join(r["content_text"] for r in source_rows if r.get("content_text"))
+    limited_text = (full_text or "")[:4000]
 
     system_msg = (
         "You are a professional ghostwriter who writes clear, structured, "
@@ -741,7 +695,7 @@ def generate_chapter_draft(chapter_id):
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_prompt},
             ],
-            max_tokens=1200,
+            max_tokens=900,
         )
         draft_text = resp.choices[0].message.content
     except Exception as e:
@@ -751,28 +705,150 @@ def generate_chapter_draft(chapter_id):
     now = now_iso()
 
     # Save draft
-    if USE_POSTGRES:
-        cur.execute(
-            "UPDATE chapters SET draft_text = %s, updated_at = %s WHERE id = %s",
-            (draft_text, now, chapter_id),
-        )
+    if DB_DIALECT == "postgres":
+        cur.execute("UPDATE chapters SET draft_text = %s, updated_at = %s WHERE id = %s", (draft_text, now, chapter_id))
     else:
-        cur.execute(
-            "UPDATE chapters SET draft_text = ?, updated_at = ? WHERE id = ?",
-            (draft_text, now, chapter_id),
-        )
+        cur.execute("UPDATE chapters SET draft_text = ?, updated_at = ? WHERE id = ?", (draft_text, now, chapter_id))
 
     conn.commit()
     conn.close()
 
-    return jsonify(
-        {
-            "status": "success",
-            "chapter_id": chapter_id,
-            "updated_at": now,
-            "draft_text": draft_text,
-        }
-    ), 200
+    # Return draft so Postman shows it
+    return jsonify({"status": "success", "chapter_id": chapter_id, "updated_at": now, "draft_text": draft_text}), 200
+
+
+@app.route("/api/projects/<int:project_id>/chapters", methods=["GET"])
+def list_chapters_for_project(project_id):
+    conn = get_db()
+    cur = conn.cursor()
+
+    if DB_DIALECT == "postgres":
+        cur.execute("SELECT id FROM book_projects WHERE id = %s", (project_id,))
+    else:
+        cur.execute("SELECT id FROM book_projects WHERE id = ?", (project_id,))
+
+    if cur.fetchone() is None:
+        conn.close()
+        return jsonify({"status": "error", "error": "Project not found"}), 404
+
+    if DB_DIALECT == "postgres":
+        cur.execute("SELECT * FROM chapters WHERE project_id = %s ORDER BY chapter_order ASC", (project_id,))
+    else:
+        cur.execute("SELECT * FROM chapters WHERE project_id = ? ORDER BY chapter_order ASC", (project_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    chapters = [row_to_dict(r) for r in rows]
+    return jsonify({"status": "success", "chapters": chapters}), 200
+
+
+@app.route("/api/projects/<int:project_id>/generate-chapters", methods=["POST"])
+def generate_chapters_for_project(project_id):
+    """
+    Generate ONE chapter draft per call – the first chapter that does not yet have draft_text.
+    Call repeatedly until all chapters are filled.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Fetch project
+    if DB_DIALECT == "postgres":
+        cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
+    else:
+        cur.execute("SELECT * FROM book_projects WHERE id = ?", (project_id,))
+
+    project_row = cur.fetchone()
+    if project_row is None:
+        conn.close()
+        return jsonify({"status": "error", "error": "Project not found"}), 404
+
+    project = row_to_dict(project_row)
+
+    # Fetch source text
+    if DB_DIALECT == "postgres":
+        cur.execute("SELECT content_text FROM source_documents WHERE project_id = %s ORDER BY created_at ASC", (project_id,))
+    else:
+        cur.execute("SELECT content_text FROM source_documents WHERE project_id = ? ORDER BY created_at ASC", (project_id,))
+    source_rows = cur.fetchall()
+
+    if not source_rows:
+        conn.close()
+        return jsonify({"status": "error", "error": "No source documents found for project"}), 400
+
+    full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
+    limited_text = full_text[:4000]
+
+    # Fetch chapters
+    if DB_DIALECT == "postgres":
+        cur.execute("SELECT * FROM chapters WHERE project_id = %s ORDER BY chapter_order ASC", (project_id,))
+    else:
+        cur.execute("SELECT * FROM chapters WHERE project_id = ? ORDER BY chapter_order ASC", (project_id,))
+    chapter_rows = cur.fetchall()
+
+    if not chapter_rows:
+        conn.close()
+        return jsonify({"status": "error", "error": "No chapters found for project"}), 400
+
+    chapters = [row_to_dict(r) for r in chapter_rows]
+
+    # Pick first chapter without draft
+    target_chapter = next((c for c in chapters if not c.get("draft_text")), None)
+
+    if target_chapter is None:
+        conn.close()
+        return jsonify({"status": "success", "message": "All chapters already have drafts."}), 200
+
+    system_msg = (
+        "You are a professional ghostwriter who creates structured, "
+        "book-quality chapters for business and memoir-style ebooks."
+    )
+
+    user_prompt = (
+        f"You are writing a chapter for an ebook.\n\n"
+        f"Project title: {project.get('title')}\n"
+        f"Subtitle: {project.get('subtitle') or ''}\n"
+        f"Target audience: {project.get('target_audience') or 'Not specified'}\n"
+        f"Tone: {project.get('tone') or 'Business-professional'}\n"
+        f"Language: {project.get('language') or 'en'}\n\n"
+        f"Chapter {target_chapter['chapter_order']}: {target_chapter['title']}\n"
+        f"Chapter summary: {target_chapter.get('summary') or 'No summary provided.'}\n\n"
+        "Source material from the author (notes, transcripts, etc.):\n"
+        f"{limited_text}\n\n"
+        "Write a complete, well-structured chapter based on the chapter title, "
+        "summary, and source material. Make it coherent, readable, and grounded "
+        "in the source material where possible."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=800,
+        )
+        draft_text = resp.choices[0].message.content
+    except Exception as e:
+        draft_text = f"[ERROR generating chapter: {e}]"
+
+    now = now_iso()
+
+    if DB_DIALECT == "postgres":
+        cur.execute("UPDATE chapters SET draft_text = %s, updated_at = %s WHERE id = %s",
+                    (draft_text, now, target_chapter["id"]))
+    else:
+        cur.execute("UPDATE chapters SET draft_text = ?, updated_at = ? WHERE id = ?",
+                    (draft_text, now, target_chapter["id"]))
+
+    conn.commit()
+    conn.close()
+
+    target_chapter["draft_text"] = draft_text
+    target_chapter["updated_at"] = now
+
+    return jsonify({"status": "success", "generated_chapters": [target_chapter]}), 200
 
 
 if __name__ == "__main__":
