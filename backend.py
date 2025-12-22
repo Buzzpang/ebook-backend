@@ -638,14 +638,7 @@ def generate_chapter_draft(chapter_id):
     )
 
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_output_tokens=900,
-        )
+        max_tokens=900,
         draft_text = resp.choices[0].message.content
     except Exception as e:
         conn.close()
@@ -819,14 +812,7 @@ def generate_chapters_for_project(project_id):
     )
 
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_prompt},
-            ],
-            max_output_tokens=800,
-        )
+        max_tokens=800,
         draft_text = resp.choices[0].message.content
     except Exception as e:
         draft_text = f"[ERROR generating chapter: {e}]"
