@@ -13,6 +13,22 @@ from openai import OpenAI
 # --- Flask & CORS setup ------------------------------------------------------
 
 app = Flask(__name__)
+import sys
+
+DEBUG_MARKER = "DEPLOY-CHECK-2025-12-23-D"  # change this string if you edit again
+
+@app.route("/api/debug/whoami", methods=["GET"])
+def whoami():
+    return jsonify({
+        "status": "debug",
+        "marker": DEBUG_MARKER,
+        "python_version": sys.version.split()[0],
+        "render_git_commit": os.getenv("RENDER_GIT_COMMIT", "unknown"),
+        "render_service_id": os.getenv("RENDER_SERVICE_ID", "unknown"),
+        "file": os.path.basename(__file__),
+        "pwd": os.getcwd(),
+    }), 200
+
 
 @app.route("/api/ping", methods=["GET"])
 def ping():
