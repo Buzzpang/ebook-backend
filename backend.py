@@ -14,6 +14,11 @@ from openai import OpenAI
 
 app = Flask(__name__)
 
+@app.route("/api/ping", methods=["GET"])
+def ping():
+    return jsonify({"status": "success", "message": "ping-ok-2025-12-22"}), 200
+
+
 CORS(
     app,
     resources={
