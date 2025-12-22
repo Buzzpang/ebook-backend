@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 from datetime import datetime
 
@@ -10,30 +11,11 @@ from psycopg2.extras import RealDictCursor
 
 from openai import OpenAI
 
-# --- Flask & CORS setup ------------------------------------------------------
+# -----------------------------------------------------------------------------
+# App setup
+# -----------------------------------------------------------------------------
 
 app = Flask(__name__)
-import sys
-
-DEBUG_MARKER = "DEPLOY-CHECK-2025-12-23-D"  # change this string if you edit again
-
-@app.route("/api/debug/whoami", methods=["GET"])
-def whoami():
-    return jsonify({
-        "status": "debug",
-        "marker": DEBUG_MARKER,
-        "python_version": sys.version.split()[0],
-        "render_git_commit": os.getenv("RENDER_GIT_COMMIT", "unknown"),
-        "render_service_id": os.getenv("RENDER_SERVICE_ID", "unknown"),
-        "file": os.path.basename(__file__),
-        "pwd": os.getcwd(),
-    }), 200
-
-
-@app.route("/api/ping", methods=["GET"])
-def ping():
-    return jsonify({"status": "success", "message": "ping-ok-2025-12-22"}), 200
-
 
 CORS(
     app,
@@ -49,11 +31,51 @@ CORS(
     },
 )
 
-# --- OpenAI client -----------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Debug / deployment marker
+# -----------------------------------------------------------------------------
+
+DEBUG_MARKER = os.getenv("DEBUG_MARKER", "DEPLOY-CHECK-2025-12-23-D")  # change if needed
+
+
+@app.route("/api/debug/whoami", methods=["GET"])
+def whoami():
+    return jsonify(
+        {
+            "status": "debug",
+            "marker": DEBUG_MARKER,
+            "python_version": sys.version.split()[0],
+            "render_git_commit": os.getenv("RENDER_GIT_COMMIT", "unknown"),
+            "render_service_id": os.getenv("RENDER_SERVICE_ID", "unknown"),
+            "file": os.path.basename(__file__),
+            "pwd": os.getcwd(),
+        }
+    ), 200
+
+
+@app.route("/api/ping", methods=["GET"])
+def ping():
+    return jsonify({"status": "success", "message": "ping-ok-2025-12-23"}), 200
+
+
+# -----------------------------------------------------------------------------
+# OpenAI client
+# -----------------------------------------------------------------------------
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- Postgres DB (Neon) ------------------------------------------------------
+# You can override models in Render env if you want
+MODEL_OUTLINE_JSON = os.getenv("OPENAI_MODEL_OUTLINE_JSON", "gpt-4.1-mini")
+MODEL_DRAFT = os.getenv("OPENAI_MODEL_DRAFT", "gpt-4.1-mini")
+MODEL_LEGACY = os.getenv("OPENAI_MODEL_LEGACY", "gpt-4.1")
+MODEL_TRANSCRIBE = os.getenv("OPENAI_MODEL_TRANSCRIBE", "gpt-4o-transcribe")
+
+# Source text limit (chars). You can override via Render env.
+MAX_SOURCE_CHARS = int(os.getenv("MAX_SOURCE_CHARS", "4000"))
+
+# -----------------------------------------------------------------------------
+# Postgres / Neon DB
+# -----------------------------------------------------------------------------
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -64,106 +86,94 @@ def get_db():
     Uses RealDictCursor so rows come back as dicts.
     """
     if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL is not set. Add it in Render -> Environment."
-        )
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    return conn
-
-
-def init_db():
-    """Create tables if they don't exist (Postgres)."""
-    conn = get_db()
-    cur = conn.cursor()
-
-    # Book projects
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS book_projects (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            subtitle TEXT,
-            target_audience TEXT,
-            tone TEXT,
-            language TEXT,
-            word_count_target INTEGER,
-            outline_json TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        """
-    )
-
-    # Source documents
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS source_documents (
-            id SERIAL PRIMARY KEY,
-            project_id INTEGER NOT NULL REFERENCES book_projects(id) ON DELETE CASCADE,
-            label TEXT,
-            content_text TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        """
-    )
-
-    # Chapters
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS chapters (
-            id SERIAL PRIMARY KEY,
-            project_id INTEGER NOT NULL REFERENCES book_projects(id) ON DELETE CASCADE,
-            chapter_order INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            summary TEXT,
-            draft_text TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        """
-    )
-
-    conn.commit()
-    cur.close()
-    conn.close()
+        raise RuntimeError("DATABASE_URL is not set. Add it in Render -> Environment.")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
 def now_iso():
-    """UTC timestamp in ISO format with Z."""
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def row_to_dict(row):
+    return dict(row) if row else None
+
+
+def init_db():
+    """Create tables if they don't exist."""
+    conn = None
+    cur = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS book_projects (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                subtitle TEXT,
+                target_audience TEXT,
+                tone TEXT,
+                language TEXT,
+                word_count_target INTEGER,
+                outline_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_documents (
+                id SERIAL PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES book_projects(id) ON DELETE CASCADE,
+                label TEXT,
+                content_text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chapters (
+                id SERIAL PRIMARY KEY,
+                project_id INTEGER NOT NULL REFERENCES book_projects(id) ON DELETE CASCADE,
+                chapter_order INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT,
+                draft_text TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+        conn.commit()
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 # Initialize DB tables at startup
 init_db()
 
-
-# --- Helpers ----------------------------------------------------------------
-
-
-def row_to_dict(row):
-    # rows are dicts already due to RealDictCursor
-    return dict(row) if row else None
-
-
-# --- Simple health check -----------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# Health check
+# -----------------------------------------------------------------------------
 
 @app.route("/")
 def index():
     return "BlueMarble AI Ebook backend is running.", 200
 
 
-# ============================================================================
-#  EXISTING MVP ENDPOINTS (upload + transcribe + simple outline/chapter)
-# ============================================================================
-
-# NOTE: Upload/transcribe uses local filesystem. Render free instances have ephemeral disk.
-# Text-based project flow below uses Postgres (persistent).
-
-
-# --- STEP 1: Upload audio ----------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# Upload / Transcribe (filesystem) - NOTE: Render disk is ephemeral unless you add a disk/S3
+# -----------------------------------------------------------------------------
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "storage")
@@ -175,19 +185,16 @@ def upload_file():
     if "file" not in request.files:
         return jsonify({"status": "error", "error": "No file uploaded"}), 400
 
-    file = request.files["file"]
-    if not file.filename:
+    f = request.files["file"]
+    if not f.filename:
         return jsonify({"status": "error", "error": "Empty filename"}), 400
 
-    filename = file.filename
+    filename = f.filename
     save_path = os.path.join(UPLOAD_DIR, filename)
-    file.save(save_path)
+    f.save(save_path)
 
     rel_path = os.path.relpath(save_path, BASE_DIR)
     return jsonify({"status": "success", "path": rel_path}), 200
-
-
-# --- STEP 2: Transcribe audio ------------------------------------------------
 
 
 @app.route("/api/transcribe", methods=["POST"])
@@ -208,7 +215,7 @@ def transcribe_audio():
     try:
         with open(audio_path, "rb") as audio_file:
             result = client.audio.transcriptions.create(
-                model="gpt-4o-transcribe",
+                model=MODEL_TRANSCRIBE,
                 file=audio_file,
             )
         transcript_text = getattr(result, "text", None) or str(result)
@@ -217,13 +224,14 @@ def transcribe_audio():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
-# --- STEP 3: Legacy free-form outline ---------------------------------------
-
+# -----------------------------------------------------------------------------
+# Legacy endpoints (kept)
+# -----------------------------------------------------------------------------
 
 @app.route("/api/generate-outline", methods=["POST"])
 def generate_outline():
     data = request.get_json(silent=True) or {}
-    text = data.get("text", "").strip()
+    text = (data.get("text") or "").strip()
 
     if not text:
         return jsonify({"status": "error", "error": "No transcription text provided"}), 400
@@ -237,7 +245,7 @@ def generate_outline():
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4.1",
+            model=MODEL_LEGACY,
             messages=[
                 {"role": "system", "content": "You help structure ebooks into clear outlines."},
                 {"role": "user", "content": prompt},
@@ -249,13 +257,10 @@ def generate_outline():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
-# --- STEP 4: Legacy single chapter generation -------------------------------
-
-
 @app.route("/api/generate-chapter", methods=["POST"])
 def generate_chapter():
     data = request.get_json(silent=True) or {}
-    outline = data.get("outline", "").strip()
+    outline = (data.get("outline") or "").strip()
 
     if not outline:
         return jsonify({"status": "error", "error": "No outline text provided"}), 400
@@ -268,7 +273,7 @@ def generate_chapter():
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4.1",
+            model=MODEL_LEGACY,
             messages=[
                 {"role": "system", "content": "You write detailed, well-structured ebook chapters."},
                 {"role": "user", "content": prompt},
@@ -280,12 +285,9 @@ def generate_chapter():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
-# ============================================================================
-#  NEW: PROJECTS + TEXT → OUTLINE (JSON) → MULTIPLE CHAPTER DRAFTS
-# ============================================================================
-
-# --- PROJECTS ----------------------------------------------------------------
-
+# -----------------------------------------------------------------------------
+# New project flow: Projects + Text -> Outline JSON -> Chapter Drafts
+# -----------------------------------------------------------------------------
 
 @app.route("/api/projects", methods=["POST"])
 def create_project():
@@ -303,74 +305,83 @@ def create_project():
 
     created_at = updated_at = now_iso()
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO book_projects
-            (title, subtitle, target_audience, tone, language,
-             word_count_target, outline_json, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING *;
-        """,
-        (
-            title,
-            subtitle,
-            target_audience,
-            tone,
-            language,
-            word_count_target,
-            None,
-            created_at,
-            updated_at,
-        ),
-    )
-    row = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return jsonify({"status": "success", "project": row_to_dict(row)}), 201
+    conn = None
+    cur = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO book_projects
+                (title, subtitle, target_audience, tone, language,
+                 word_count_target, outline_json, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING *;
+            """,
+            (title, subtitle, target_audience, tone, language, word_count_target, None, created_at, updated_at),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return jsonify({"status": "success", "project": row_to_dict(row)}), 201
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({"status": "error", "error": str(e)}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 @app.route("/api/projects", methods=["GET"])
 def list_projects():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM book_projects ORDER BY created_at DESC")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    return jsonify({"status": "success", "projects": [row_to_dict(r) for r in rows]}), 200
+    conn = None
+    cur = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM book_projects ORDER BY created_at DESC")
+        rows = cur.fetchall()
+        return jsonify({"status": "success", "projects": [row_to_dict(r) for r in rows]}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 @app.route("/api/projects/<int:project_id>", methods=["GET"])
 def get_project(project_id):
-    conn = get_db()
-    cur = conn.cursor()
+    conn = None
+    cur = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "Project not found"}), 404
+        cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"status": "error", "error": "Project not found"}), 404
 
-    project = row_to_dict(row)
+        project = row_to_dict(row)
 
-    cur.execute("SELECT COUNT(*) AS cnt FROM source_documents WHERE project_id = %s", (project_id,))
-    project["source_document_count"] = cur.fetchone()["cnt"]
+        cur.execute("SELECT COUNT(*) AS cnt FROM source_documents WHERE project_id = %s", (project_id,))
+        project["source_document_count"] = cur.fetchone()["cnt"]
 
-    cur.execute("SELECT COUNT(*) AS cnt FROM chapters WHERE project_id = %s", (project_id,))
-    project["chapter_count"] = cur.fetchone()["cnt"]
+        cur.execute("SELECT COUNT(*) AS cnt FROM chapters WHERE project_id = %s", (project_id,))
+        project["chapter_count"] = cur.fetchone()["cnt"]
 
-    cur.close()
-    conn.close()
-    return jsonify({"status": "success", "project": project}), 200
-
-
-# --- SOURCE DOCUMENTS (TEXT INPUT) ------------------------------------------
+        return jsonify({"status": "success", "project": project}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 @app.route("/api/projects/<int:project_id>/add-text", methods=["POST"])
@@ -383,120 +394,134 @@ def add_text_source(project_id):
     label = (data.get("label") or "").strip() or "Untitled source"
     now = now_iso()
 
-    conn = get_db()
-    cur = conn.cursor()
+    conn = None
+    cur = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    cur.execute("SELECT id FROM book_projects WHERE id = %s", (project_id,))
-    if cur.fetchone() is None:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "Project not found"}), 404
+        cur.execute("SELECT id FROM book_projects WHERE id = %s", (project_id,))
+        if cur.fetchone() is None:
+            return jsonify({"status": "error", "error": "Project not found"}), 404
 
-    cur.execute(
-        """
-        INSERT INTO source_documents
-            (project_id, label, content_text, created_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s)
-        RETURNING *;
-        """,
-        (project_id, label, text, now, now),
-    )
-    row = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return jsonify({"status": "success", "source_document": row_to_dict(row)}), 201
+        cur.execute(
+            """
+            INSERT INTO source_documents
+                (project_id, label, content_text, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING *;
+            """,
+            (project_id, label, text, now, now),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return jsonify({"status": "success", "source_document": row_to_dict(row)}), 201
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return jsonify({"status": "error", "error": str(e)}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 @app.route("/api/projects/<int:project_id>/sources", methods=["GET"])
 def list_sources(project_id):
-    conn = get_db()
-    cur = conn.cursor()
+    conn = None
+    cur = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    cur.execute("SELECT id FROM book_projects WHERE id = %s", (project_id,))
-    if cur.fetchone() is None:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "Project not found"}), 404
+        cur.execute("SELECT id FROM book_projects WHERE id = %s", (project_id,))
+        if cur.fetchone() is None:
+            return jsonify({"status": "error", "error": "Project not found"}), 404
 
-    cur.execute(
-        """
-        SELECT * FROM source_documents
-        WHERE project_id = %s
-        ORDER BY created_at ASC
-        """,
-        (project_id,),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    return jsonify({"status": "success", "source_documents": [row_to_dict(r) for r in rows]}), 200
-
-
-# --- OUTLINE (JSON) + CHAPTER CREATION --------------------------------------
+        cur.execute(
+            """
+            SELECT * FROM source_documents
+            WHERE project_id = %s
+            ORDER BY created_at ASC
+            """,
+            (project_id,),
+        )
+        rows = cur.fetchall()
+        return jsonify({"status": "success", "source_documents": [row_to_dict(r) for r in rows]}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 @app.route("/api/projects/<int:project_id>/build-outline", methods=["POST"])
 def build_outline_for_project(project_id):
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
-    project_row = cur.fetchone()
-    if project_row is None:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "Project not found"}), 404
-
-    project = row_to_dict(project_row)
-
-    cur.execute(
-        """
-        SELECT content_text
-        FROM source_documents
-        WHERE project_id = %s
-        ORDER BY created_at ASC
-        """,
-        (project_id,),
-    )
-    source_rows = cur.fetchall()
-    if not source_rows:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "No source documents found for project"}), 400
-
-    full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
-    MAX_SOURCE_CHARS = 4000
-    limited_text = full_text[:MAX_SOURCE_CHARS]
-
-    system_msg = "You are an expert editorial planner. You structure ebooks into clear chapters."
-
-    user_prompt = (
-        "Create a structured JSON outline for an ebook based on the provided material.\n"
-        "The JSON must use this exact schema:\n\n"
-        "{\n"
-        '  "chapters": [\n'
-        "    {\n"
-        '      "order": 1,\n'
-        '      "title": "Chapter title",\n'
-        '      "summary": "2-3 sentence summary of the chapter"\n'
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        "Constraints:\n"
-        f"- Target audience: {project.get('target_audience') or 'Not specified'}\n"
-        f"- Tone: {project.get('tone') or 'Business-professional'}\n"
-        f"- Target language: {project.get('language') or 'en'}\n"
-        "Make the number of chapters and structure appropriate for a serious ebook.\n\n"
-        "SOURCE MATERIAL:\n"
-        + limited_text
-    )
-
+    """
+    Build a JSON outline using all source documents and write chapters.
+    IMPORTANT: This function is atomic: if anything fails, DB changes are rolled back.
+    """
+    conn = None
+    cur = None
     try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        # Ensure project exists
+        cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
+        project_row = cur.fetchone()
+        if project_row is None:
+            return jsonify({"status": "error", "error": "Project not found"}), 404
+
+        project = row_to_dict(project_row)
+
+        # Load all source documents
+        cur.execute(
+            """
+            SELECT content_text
+            FROM source_documents
+            WHERE project_id = %s
+            ORDER BY created_at ASC
+            """,
+            (project_id,),
+        )
+        source_rows = cur.fetchall()
+        if not source_rows:
+            return jsonify({"status": "error", "error": "No source documents found for project"}), 400
+
+        full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
+        limited_text = full_text[:MAX_SOURCE_CHARS]
+
+        system_msg = "You are an expert editorial planner. You structure ebooks into clear chapters."
+
+        user_prompt = (
+            "Create a structured JSON outline for an ebook based on the provided material.\n"
+            "The JSON must use this exact schema:\n\n"
+            "{\n"
+            '  "chapters": [\n'
+            "    {\n"
+            '      "order": 1,\n'
+            '      "title": "Chapter title",\n'
+            '      "summary": "2-3 sentence summary of the chapter"\n'
+            "    },\n"
+            "    ...\n"
+            "  ]\n"
+            "}\n\n"
+            "Constraints:\n"
+            f"- Target audience: {project.get('target_audience') or 'Not specified'}\n"
+            f"- Tone: {project.get('tone') or 'Business-professional'}\n"
+            f"- Target language: {project.get('language') or 'en'}\n"
+            "Make the number of chapters and structure appropriate for a serious ebook.\n\n"
+            "SOURCE MATERIAL:\n"
+            + limited_text
+        )
+
+        # OpenAI call
         response = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=MODEL_OUTLINE_JSON,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": system_msg},
@@ -505,138 +530,219 @@ def build_outline_for_project(project_id):
         )
         outline_json_str = response.choices[0].message.content
         outline_data = json.loads(outline_json_str)
+
+        chapters = outline_data.get("chapters") or []
+        if not isinstance(chapters, list) or not chapters:
+            return jsonify({"status": "error", "error": "Model did not return a valid 'chapters' list in JSON."}), 500
+
+        now = now_iso()
+
+        # ---- ATOMIC DB UPDATE START ----
+        # If anything fails below, we'll rollback.
+        cur.execute("DELETE FROM chapters WHERE project_id = %s", (project_id,))
+
+        saved_chapters = []
+        for ch in chapters:
+            order = int(ch.get("order") or 0)
+            title = (ch.get("title") or "").strip()
+            summary = (ch.get("summary") or "").strip() or None
+
+            if not title:
+                continue
+
+            cur.execute(
+                """
+                INSERT INTO chapters
+                    (project_id, chapter_order, title, summary, draft_text, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING *;
+                """,
+                (project_id, order, title, summary, None, now, now),
+            )
+            saved_chapters.append(row_to_dict(cur.fetchone()))
+
+        cur.execute(
+            "UPDATE book_projects SET outline_json = %s, updated_at = %s WHERE id = %s",
+            (json.dumps(outline_data), now, project_id),
+        )
+
+        conn.commit()
+        # ---- ATOMIC DB UPDATE END ----
+
+        saved_chapters_sorted = sorted(saved_chapters, key=lambda c: c["chapter_order"])
+        return jsonify({"status": "success", "outline": outline_data, "chapters": saved_chapters_sorted}), 200
+
     except Exception as e:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": f"Outline generation failed: {e}"}), 500
+        if conn:
+            conn.rollback()
+        return jsonify({"status": "error", "error": f"build-outline failed: {e}"}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
-    chapters = outline_data.get("chapters") or []
-    if not isinstance(chapters, list) or not chapters:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "Model did not return a valid 'chapters' list in JSON."}), 500
 
-    now = now_iso()
+@app.route("/api/projects/<int:project_id>/chapters", methods=["GET"])
+def list_chapters_for_project(project_id):
+    conn = None
+    cur = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
 
-    # Clear existing chapters for this project
-    cur.execute("DELETE FROM chapters WHERE project_id = %s", (project_id,))
-
-    saved_chapters = []
-    for ch in chapters:
-        order = int(ch.get("order") or 0)
-        title = (ch.get("title") or "").strip()
-        summary = (ch.get("summary") or "").strip() or None
-        if not title:
-            continue
+        cur.execute("SELECT id FROM book_projects WHERE id = %s", (project_id,))
+        if cur.fetchone() is None:
+            return jsonify({"status": "error", "error": "Project not found"}), 404
 
         cur.execute(
             """
-            INSERT INTO chapters
-                (project_id, chapter_order, title, summary, draft_text, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            RETURNING *;
+            SELECT * FROM chapters
+            WHERE project_id = %s
+            ORDER BY chapter_order ASC
             """,
-            (project_id, order, title, summary, None, now, now),
+            (project_id,),
         )
-        saved_chapters.append(row_to_dict(cur.fetchone()))
-
-    # Persist outline JSON on project
-    cur.execute(
-        "UPDATE book_projects SET outline_json = %s, updated_at = %s WHERE id = %s",
-        (json.dumps(outline_data), now, project_id),
-    )
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    saved_chapters_sorted = sorted(saved_chapters, key=lambda c: c["chapter_order"])
-    return jsonify({"status": "success", "outline": outline_data, "chapters": saved_chapters_sorted}), 200
+        rows = cur.fetchall()
+        return jsonify({"status": "success", "chapters": [row_to_dict(r) for r in rows]}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
-# --- CHAPTER LIST & SINGLE-CHAPTER DRAFT ------------------------------------
+@app.route("/api/projects/<int:project_id>/chapters/<int:chapter_id>", methods=["GET"])
+def get_project_chapter(project_id, chapter_id):
+    conn = None
+    cur = None
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            SELECT * FROM chapters
+            WHERE project_id = %s AND id = %s
+            """,
+            (project_id, chapter_id),
+        )
+        row = cur.fetchone()
+        if not row:
+            return jsonify({"status": "error", "error": "Chapter not found"}), 404
+
+        return jsonify({"status": "success", "chapter": row_to_dict(row)}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 @app.route("/api/chapters/<int:chapter_id>/generate-draft", methods=["POST"])
 def generate_chapter_draft(chapter_id):
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT
-            c.*,
-            p.title AS project_title,
-            p.subtitle AS project_subtitle,
-            p.target_audience,
-            p.tone,
-            p.language
-        FROM chapters c
-        JOIN book_projects p ON c.project_id = p.id
-        WHERE c.id = %s
-        """,
-        (chapter_id,),
-    )
-    row = cur.fetchone()
-    if row is None:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "Chapter not found"}), 404
-
-    chapter = row_to_dict(row)
-
-    cur.execute(
-        """
-        SELECT content_text
-        FROM source_documents
-        WHERE project_id = %s
-        ORDER BY created_at ASC
-        """,
-        (chapter["project_id"],),
-    )
-    source_rows = cur.fetchall()
-
-    full_text = "\n\n".join(r["content_text"] for r in source_rows if r.get("content_text"))
-    MAX_SOURCE_CHARS = 4000
-    limited_text = (full_text or "")[:MAX_SOURCE_CHARS]
-
-    system_msg = (
-        "You are a professional ghostwriter who writes clear, structured, "
-        "business ebooks for busy professionals."
-    )
-
-    user_prompt = (
-        f"You are writing a chapter for an ebook.\n\n"
-        f"Book title: {chapter.get('project_title')}\n"
-        f"Subtitle: {chapter.get('project_subtitle') or ''}\n"
-        f"Target audience: {chapter.get('target_audience') or 'Business readers'}\n"
-        f"Tone: {chapter.get('tone') or 'Professional'}\n"
-        f"Language: {chapter.get('language') or 'en'}\n\n"
-        f"Chapter {chapter['chapter_order']}: {chapter['title']}\n"
-        f"Chapter summary:\n{chapter.get('summary') or 'No summary provided.'}\n\n"
-        "Source material from the author (notes, transcripts, etc.):\n"
-        f"{limited_text}\n\n"
-        "Write a complete, well-structured draft of this chapter.\n"
-        "- 800–1,200 words.\n"
-        "- Use short paragraphs and helpful subheadings.\n"
-        "- Keep the tone business-professional and easy to read.\n"
-    )
-
+    """
+    Generate a draft for a single chapter.
+    If OpenAI fails: returns 500 and does NOT write to DB.
+    """
+    conn = None
+    cur = None
     try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        # Load chapter + project metadata
+        cur.execute(
+            """
+            SELECT
+                c.*,
+                p.title AS project_title,
+                p.subtitle AS project_subtitle,
+                p.target_audience,
+                p.tone,
+                p.language
+            FROM chapters c
+            JOIN book_projects p ON c.project_id = p.id
+            WHERE c.id = %s
+            """,
+            (chapter_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return jsonify({"status": "error", "error": "Chapter not found"}), 404
+
+        chapter = row_to_dict(row)
+
+        # Load source text
+        cur.execute(
+            """
+            SELECT content_text
+            FROM source_documents
+            WHERE project_id = %s
+            ORDER BY created_at ASC
+            """,
+            (chapter["project_id"],),
+        )
+        source_rows = cur.fetchall()
+
+        full_text = "\n\n".join(r["content_text"] for r in source_rows if r.get("content_text"))
+        limited_text = (full_text or "")[:MAX_SOURCE_CHARS]
+
+        system_msg = (
+            "You are a professional ghostwriter who writes clear, structured, "
+            "business ebooks for busy professionals."
+        )
+
+        user_prompt = (
+            f"You are writing a chapter for an ebook.\n\n"
+            f"Book title: {chapter.get('project_title')}\n"
+            f"Subtitle: {chapter.get('project_subtitle') or ''}\n"
+            f"Target audience: {chapter.get('target_audience') or 'Business readers'}\n"
+            f"Tone: {chapter.get('tone') or 'Professional'}\n"
+            f"Language: {chapter.get('language') or 'en'}\n\n"
+            f"Chapter {chapter['chapter_order']}: {chapter['title']}\n"
+            f"Chapter summary:\n{chapter.get('summary') or 'No summary provided.'}\n\n"
+            "Source material from the author (notes, transcripts, etc.):\n"
+            f"{limited_text}\n\n"
+            "Write a complete, well-structured draft of this chapter.\n"
+            "- 800–1,200 words.\n"
+            "- Use short paragraphs and helpful subheadings.\n"
+            "- Keep the tone business-professional and easy to read.\n"
+        )
+
+        # OpenAI call
         resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=MODEL_DRAFT,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_prompt},
             ],
-            # chat.completions uses max_tokens
             max_tokens=1200,
             temperature=0.7,
         )
         draft_text = resp.choices[0].message.content
+
+        # Save
+        now = now_iso()
+        cur.execute(
+            """
+            UPDATE chapters
+            SET draft_text = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (draft_text, now, chapter_id),
+        )
+        conn.commit()
+
+        return jsonify({"status": "success", "chapter_id": chapter_id, "updated_at": now}), 200
+
     except Exception as e:
-        cur.close()
-        conn.close()
+        if conn:
+            conn.rollback()
         return jsonify(
             {
                 "status": "error",
@@ -644,154 +750,91 @@ def generate_chapter_draft(chapter_id):
                 "details": str(e),
             }
         ), 500
-
-    now = now_iso()
-    cur.execute(
-        """
-        UPDATE chapters
-        SET draft_text = %s, updated_at = %s
-        WHERE id = %s
-        """,
-        (draft_text, now, chapter_id),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return jsonify({"status": "success", "chapter_id": chapter_id, "updated_at": now}), 200
-
-
-@app.route("/api/projects/<int:project_id>/chapters", methods=["GET"])
-def list_chapters_for_project(project_id):
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT id FROM book_projects WHERE id = %s", (project_id,))
-    if cur.fetchone() is None:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "Project not found"}), 404
-
-    cur.execute(
-        """
-        SELECT * FROM chapters
-        WHERE project_id = %s
-        ORDER BY chapter_order ASC
-        """,
-        (project_id,),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    return jsonify({"status": "success", "chapters": [row_to_dict(r) for r in rows]}), 200
-
-
-@app.route("/api/projects/<int:project_id>/chapters/<int:chapter_id>", methods=["GET"])
-def get_project_chapter(project_id, chapter_id):
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT * FROM chapters
-        WHERE project_id = %s AND id = %s
-        """,
-        (project_id, chapter_id),
-    )
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    if not row:
-        return jsonify({"status": "error", "error": "Chapter not found"}), 404
-
-    return jsonify({"status": "success", "chapter": row_to_dict(row)}), 200
-
-
-# --- GENERATE DRAFTS FOR CHAPTERS (ONE PER CALL) ----------------------------
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
 @app.route("/api/projects/<int:project_id>/generate-chapters", methods=["POST"])
 def generate_chapters_for_project(project_id):
     """
     Generate ONE chapter draft per call – the first chapter that does not yet have draft_text.
-    Call repeatedly until all chapters are filled.
+    If OpenAI fails: returns 500 and does NOT write to DB.
     """
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
-    project_row = cur.fetchone()
-    if project_row is None:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "Project not found"}), 404
-    project = row_to_dict(project_row)
-
-    cur.execute(
-        """
-        SELECT content_text
-        FROM source_documents
-        WHERE project_id = %s
-        ORDER BY created_at ASC
-        """,
-        (project_id,),
-    )
-    source_rows = cur.fetchall()
-    if not source_rows:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "No source documents found for project"}), 400
-
-    full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
-    MAX_SOURCE_CHARS = 4000
-    limited_text = full_text[:MAX_SOURCE_CHARS]
-
-    cur.execute(
-        "SELECT * FROM chapters WHERE project_id = %s ORDER BY chapter_order ASC",
-        (project_id,),
-    )
-    chapter_rows = cur.fetchall()
-    if not chapter_rows:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "error", "error": "No chapters found for project"}), 400
-
-    chapters = [row_to_dict(r) for r in chapter_rows]
-
-    target_chapter = next((c for c in chapters if not c.get("draft_text")), None)
-    if target_chapter is None:
-        cur.close()
-        conn.close()
-        return jsonify({"status": "success", "message": "All chapters already have drafts."}), 200
-
-    system_msg = (
-        "You are a professional ghostwriter who creates structured, "
-        "book-quality chapters for business and memoir-style ebooks."
-    )
-
-    user_prompt = (
-        f"You are writing a chapter for an ebook.\n\n"
-        f"Project title: {project.get('title')}\n"
-        f"Subtitle: {project.get('subtitle') or ''}\n"
-        f"Target audience: {project.get('target_audience') or 'Not specified'}\n"
-        f"Tone: {project.get('tone') or 'Business-professional'}\n"
-        f"Language: {project.get('language') or 'en'}\n\n"
-        f"Chapter {target_chapter['chapter_order']}: {target_chapter['title']}\n"
-        f"Chapter summary: {target_chapter.get('summary') or 'No summary provided.'}\n\n"
-        "Source material from the author (notes, transcripts, etc.):\n"
-        f"{limited_text}\n\n"
-        "Write a complete, well-structured chapter based on the chapter title, "
-        "summary, and source material. Make it coherent, readable, and grounded "
-        "in the source material where possible.\n"
-        "- 800–1,200 words\n"
-        "- Use short paragraphs and subheadings\n"
-    )
-
+    conn = None
+    cur = None
     try:
+        conn = get_db()
+        cur = conn.cursor()
+
+        # Fetch project
+        cur.execute("SELECT * FROM book_projects WHERE id = %s", (project_id,))
+        project_row = cur.fetchone()
+        if project_row is None:
+            return jsonify({"status": "error", "error": "Project not found"}), 404
+        project = row_to_dict(project_row)
+
+        # Fetch source text
+        cur.execute(
+            """
+            SELECT content_text
+            FROM source_documents
+            WHERE project_id = %s
+            ORDER BY created_at ASC
+            """,
+            (project_id,),
+        )
+        source_rows = cur.fetchall()
+        if not source_rows:
+            return jsonify({"status": "error", "error": "No source documents found for project"}), 400
+
+        full_text = "\n\n".join(r["content_text"] for r in source_rows).strip()
+        limited_text = full_text[:MAX_SOURCE_CHARS]
+
+        # Fetch chapters
+        cur.execute(
+            "SELECT * FROM chapters WHERE project_id = %s ORDER BY chapter_order ASC",
+            (project_id,),
+        )
+        chapter_rows = cur.fetchall()
+        if not chapter_rows:
+            return jsonify({"status": "error", "error": "No chapters found for project"}), 400
+
+        chapters = [row_to_dict(r) for r in chapter_rows]
+
+        # Pick the first chapter without a draft
+        target_chapter = next((c for c in chapters if not c.get("draft_text")), None)
+        if target_chapter is None:
+            return jsonify({"status": "success", "message": "All chapters already have drafts."}), 200
+
+        system_msg = (
+            "You are a professional ghostwriter who creates structured, "
+            "book-quality chapters for business and memoir-style ebooks."
+        )
+
+        user_prompt = (
+            f"You are writing a chapter for an ebook.\n\n"
+            f"Project title: {project.get('title')}\n"
+            f"Subtitle: {project.get('subtitle') or ''}\n"
+            f"Target audience: {project.get('target_audience') or 'Not specified'}\n"
+            f"Tone: {project.get('tone') or 'Business-professional'}\n"
+            f"Language: {project.get('language') or 'en'}\n\n"
+            f"Chapter {target_chapter['chapter_order']}: {target_chapter['title']}\n"
+            f"Chapter summary: {target_chapter.get('summary') or 'No summary provided.'}\n\n"
+            "Source material from the author (notes, transcripts, etc.):\n"
+            f"{limited_text}\n\n"
+            "Write a complete, well-structured chapter based on the chapter title, "
+            "summary, and source material. Make it coherent, readable, and grounded "
+            "in the source material where possible.\n"
+            "- 800–1,200 words\n"
+            "- Use short paragraphs and subheadings\n"
+        )
+
+        # OpenAI call (if this fails, we return 500 and do NOT update DB)
         resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model=MODEL_DRAFT,
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_prompt},
@@ -800,30 +843,44 @@ def generate_chapters_for_project(project_id):
             temperature=0.7,
         )
         draft_text = resp.choices[0].message.content
+
+        now = now_iso()
+        cur.execute(
+            """
+            UPDATE chapters
+            SET draft_text = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (draft_text, now, target_chapter["id"]),
+        )
+        conn.commit()
+
+        # Return the updated chapter row
+        cur.execute("SELECT * FROM chapters WHERE id = %s", (target_chapter["id"],))
+        updated = row_to_dict(cur.fetchone())
+
+        return jsonify({"status": "success", "generated_chapters": [updated]}), 200
+
     except Exception as e:
-        draft_text = f"[ERROR generating chapter: {e}]"
-
-    now = now_iso()
-    cur.execute(
-        """
-        UPDATE chapters
-        SET draft_text = %s, updated_at = %s
-        WHERE id = %s
-        """,
-        (draft_text, now, target_chapter["id"]),
-    )
-    conn.commit()
-
-    # Refresh the updated chapter row
-    cur.execute("SELECT * FROM chapters WHERE id = %s", (target_chapter["id"],))
-    updated = row_to_dict(cur.fetchone())
-
-    cur.close()
-    conn.close()
-    return jsonify({"status": "success", "generated_chapters": [updated]}), 200
+        if conn:
+            conn.rollback()
+        return jsonify(
+            {
+                "status": "error",
+                "error": "generate-chapters failed",
+                "details": str(e),
+            }
+        ), 500
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 
-# --- Local dev entrypoint (Render uses: gunicorn backend:app) ----------------
+# -----------------------------------------------------------------------------
+# Local dev entrypoint (Render uses: gunicorn backend:app)
+# -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
